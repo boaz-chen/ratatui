@@ -218,6 +218,60 @@ pub struct Table<'a> {
 
     /// Controls how to distribute extra space among the columns
     flex: Flex,
+
+    virtual_rows: Option<VirtualRows<'a>>,
+}
+
+struct VirtualRows<'a> {
+    data_callback: Box<dyn Fn(usize, usize) -> Vec<Row<'a>> + 'a>,
+    row_count: usize,
+}
+
+impl<'a> Default for VirtualRows<'a> {
+    fn default() -> Self {
+        Self {
+            data_callback: Box::new(|_, _| Vec::new()),
+            row_count: 0,
+        }
+    }
+}
+
+impl<'a> std::fmt::Debug for VirtualRows<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VirtualRows")
+            .field("row_count", &self.row_count)
+            .finish()
+    }
+}
+
+impl<'a> Clone for VirtualRows<'a> {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl<'a> PartialEq for VirtualRows<'a> {
+    fn eq(&self, other: &Self) -> bool {
+        self.row_count == other.row_count
+    }
+}
+
+impl<'a> Eq for VirtualRows<'a> {}
+
+impl<'a> std::hash::Hash for VirtualRows<'a> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.row_count.hash(state);
+    }
+}
+
+impl<'a> VirtualRows<'a> {
+    fn create_metadata_rows(&self) -> Vec<Row<'a>> {
+        vec![Row::default().height(1); self.row_count]
+    }
+
+    fn fetch_data_rows(&self, start: usize, end: usize) -> Vec<Row<'a>> {
+        (self.data_callback)(start, end)
+    }
 }
 
 impl<'a> Default for Table<'a> {
@@ -234,6 +288,7 @@ impl<'a> Default for Table<'a> {
             highlight_symbol: Text::default(),
             highlight_spacing: HighlightSpacing::default(),
             flex: Flex::Start,
+            virtual_rows: None,
         }
     }
 }
@@ -562,6 +617,19 @@ impl<'a> Table<'a> {
         self.flex = flex;
         self
     }
+
+    /// TODO: document
+    pub fn virtual_rows(
+        mut self,
+        data_callback: Box<dyn Fn(usize, usize) -> Vec<Row<'a>> + 'a>,
+        row_count: usize,
+    ) -> Self {
+        self.virtual_rows = Some(VirtualRows {
+            data_callback,
+            row_count,
+        });
+        self
+    }
 }
 
 impl Widget for Table<'_> {
@@ -674,7 +742,7 @@ impl Table<'_> {
         highlight_symbol: &Text<'_>,
         columns_widths: &[(u16, u16)],
     ) {
-        if self.rows.is_empty() {
+        if self.rows.is_empty() && self.virtual_rows.is_none() {
             return;
         }
 
@@ -682,14 +750,29 @@ impl Table<'_> {
             self.get_row_bounds(state.selected, state.offset, area.height);
         state.offset = start_index;
 
+        let virtual_data_rows = self
+            .virtual_rows
+            .as_ref()
+            .map_or_else(|| vec![], |vr| vr.fetch_data_rows(start_index, end_index));
+
+        let rows: Vec<_> = self.virtual_rows.as_ref().map_or(
+            self.rows
+                .iter()
+                .enumerate()
+                .skip(state.offset)
+                .take(end_index - start_index)
+                .collect(),
+            |_| {
+                virtual_data_rows
+                    .iter()
+                    .enumerate()
+                    .map(|(index, row)| (index + state.offset, row))
+                    .collect()
+            },
+        );
+
         let mut y_offset = 0;
-        for (i, row) in self
-            .rows
-            .iter()
-            .enumerate()
-            .skip(state.offset)
-            .take(end_index - start_index)
-        {
+        for (i, row) in rows {
             let row_area = Rect::new(
                 area.x,
                 area.y + y_offset + row.top_margin,
@@ -756,11 +839,28 @@ impl Table<'_> {
         offset: usize,
         max_height: u16,
     ) -> (usize, usize) {
-        let offset = offset.min(self.rows.len().saturating_sub(1));
+        let rows_len = self
+            .virtual_rows
+            .as_ref()
+            .map(|d| d.row_count)
+            .unwrap_or(self.rows.len());
+
+        let offset = offset.min(rows_len.saturating_sub(1));
         let mut start = offset;
         let mut end = offset;
         let mut height = 0;
-        for item in self.rows.iter().skip(offset) {
+
+        let metadata_rows = self
+            .virtual_rows
+            .as_ref()
+            .map_or_else(|| vec![], |vr| vr.create_metadata_rows());
+
+        let rows = self
+            .virtual_rows
+            .as_ref()
+            .map_or(&self.rows, |_| &metadata_rows);
+
+        for item in rows.iter().skip(offset) {
             if height + item.height > max_height {
                 break;
             }
@@ -768,21 +868,21 @@ impl Table<'_> {
             end += 1;
         }
 
-        let selected = selected.unwrap_or(0).min(self.rows.len() - 1);
+        let selected = selected.unwrap_or(0).min(rows_len - 1);
         while selected >= end {
-            height = height.saturating_add(self.rows[end].height_with_margin());
+            height = height.saturating_add(rows[end].height_with_margin());
             end += 1;
             while height > max_height {
-                height = height.saturating_sub(self.rows[start].height_with_margin());
+                height = height.saturating_sub(rows[start].height_with_margin());
                 start += 1;
             }
         }
         while selected < start {
             start -= 1;
-            height = height.saturating_add(self.rows[start].height_with_margin());
+            height = height.saturating_add(rows[start].height_with_margin());
             while height > max_height {
                 end -= 1;
-                height = height.saturating_sub(self.rows[end].height_with_margin());
+                height = height.saturating_sub(rows[end].height_with_margin());
             }
         }
         (start, end)
